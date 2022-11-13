@@ -1,0 +1,8 @@
+/target
+*.bat
+cmds
+.vscode
+venv
+releases
+skybot.exe
+config.json
