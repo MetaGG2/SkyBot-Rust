@@ -38,16 +38,18 @@ struct Music;
 struct TrackEndNotifier {
     chan_id: ChannelId,
     http: Arc<Http>,
-    guild: GuildId,
+    context: Context,
+    guild: GuildId
 }
 
 #[async_trait]
 impl VoiceEventHandler for TrackEndNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::Track(&[(_state, track)]) = ctx {
-            let manager = songbird::Songbird::serenity().get(self.guild);
+            let manager = songbird::get(&self.context).await.unwrap();
+            let handle = manager.get(self.guild);
 
-            if manager.is_none() {
+            if handle.is_none() {
                 self.chan_id.send_message(self.http.clone(), |m|
                 m.embed(|e|
                     e.title("Queue has Ended")
@@ -58,8 +60,8 @@ impl VoiceEventHandler for TrackEndNotifier {
                 return None;
             }
 
-            let manager = manager.unwrap();
-            let handler = manager.lock().await;
+            let handle = handle.unwrap();
+            let handler = handle.lock().await;
             let queue = handler.queue().current_queue();
 
             if queue.len() == 0 {
@@ -73,7 +75,7 @@ impl VoiceEventHandler for TrackEndNotifier {
                 return None;
             }
 
-            let next_track = &queue[1];
+            let next_track = &queue[0];
             let metadata = next_track.metadata();
 
 
@@ -152,9 +154,12 @@ async fn join(ctx: &Context, msg: &Message) -> CommandResult {
             TrackEndNotifier {
                 chan_id,
                 http: send_http.clone(),
+                context: ctx.clone(),
                 guild: guild_id
             },
         );
+
+        drop(handle);
 
     } else {
             msg.channel_id
@@ -223,7 +228,7 @@ async fn pause(ctx: &Context, msg: &Message) -> CommandResult {
         },
     };
 
-    let mut handler = handler_lock.lock().await;
+    let handler = handler_lock.lock().await;
 
     if handler.queue().current().is_none() {
         msg.channel_id.send_message(ctx, |m|
@@ -240,6 +245,8 @@ async fn pause(ctx: &Context, msg: &Message) -> CommandResult {
         .await
         .unwrap()
         .playing;
+
+    drop(handler);
         
 
     if matches!(play_status, PlayMode::Play) {
@@ -414,6 +421,7 @@ async fn skip(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
     if let Some(handler_lock) = manager.get(guild_id) {
         let handler = handler_lock.lock().await;
         let queue = handler.queue();
+        drop(&handler);
         let _ = queue.skip();
 
         msg.channel_id
@@ -445,6 +453,7 @@ async fn stop(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
     if let Some(handler_lock) = manager.get(guild_id) {
         let handler = handler_lock.lock().await;
         let queue = handler.queue();
+        drop(&handler);
         queue.stop();
 
         msg.channel_id.say(&ctx.http, "Skipped song and cleared queue").await;
@@ -468,9 +477,7 @@ async fn resume(ctx: &Context, msg: &Message) -> CommandResult {
         .clone();
 
     if let Some(handler_lock) = manager.get(guild_id) {
-        let mut handler = handler_lock.lock().await;
-
-        let mut handler = handler_lock.lock().await;
+        let handler = handler_lock.lock().await;
 
         if handler.queue().current().is_none() {
             msg.channel_id.send_message(ctx, |m|
@@ -487,6 +494,8 @@ async fn resume(ctx: &Context, msg: &Message) -> CommandResult {
             .await
             .unwrap()
             .playing;
+
+        drop(handler);
 
         if matches!(play_status, PlayMode::Pause) {
             current_track.play();
