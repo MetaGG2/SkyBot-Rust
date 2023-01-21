@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-    },
+    }, fs::File, io::Write,
 };
 
 use serenity::{
@@ -20,18 +20,18 @@ use serenity::{
 };
 
 use songbird::{
-    input::Restartable,
+    input::{Restartable, Metadata},
     Event,
     EventContext,
     EventHandler as VoiceEventHandler,
-    TrackEvent, tracks::PlayMode,
+    TrackEvent, tracks::{PlayMode, LoopState, self},
 };
 
-use crate::utils::utilities::duration_formatter;
+use crate::utils::utilities::{duration_formatter, num_prefix};
 
 
 #[group]
-#[commands(join, leave, pause, resume, play, stop, queue, skip, resume)]
+#[commands(join, leave, pause, resume, play, stop, queue, skip, remove, loop_command, volume)]
 struct Music;
 
 
@@ -57,11 +57,14 @@ impl VoiceEventHandler for TrackEndNotifier {
                     .color(Colour::GOLD)
                 )).await;
 
+                drop(handle);
+                self.context.idle().await;
+
                 return None;
             }
 
             let handle = handle.unwrap();
-            let handler = handle.lock().await;
+            let mut handler = handle.lock().await;
             let queue = handler.queue().current_queue();
 
             if queue.len() == 0 {
@@ -71,6 +74,9 @@ impl VoiceEventHandler for TrackEndNotifier {
                         .description(format!("Last song played: **{:?}**\nTo continue listening, play another song!", track.metadata().title.clone().unwrap()))
                         .color(Colour::GOLD)
                     )).await;
+
+                handler.leave().await;
+                drop(handler);
 
                 return None;
             }
@@ -112,6 +118,8 @@ impl VoiceEventHandler for TrackEndNotifier {
 
 
 #[command]
+#[description = "Joins the voice channel you are currently in"]
+#[usage = "!join"]
 #[only_in(guilds)]
 async fn join(ctx: &Context, msg: &Message) -> CommandResult {
     let guild = msg.guild(&ctx.cache).unwrap();
@@ -125,7 +133,7 @@ async fn join(ctx: &Context, msg: &Message) -> CommandResult {
     let connect_to = match channel_id {
         Some(channel) => channel,
         None => {
-            msg.reply(ctx, "Not in a voice channel").await;
+            msg.reply(ctx, "Not in a voice channel").await?;
 
             return Ok(());
         },
@@ -141,7 +149,7 @@ async fn join(ctx: &Context, msg: &Message) -> CommandResult {
     if let Ok(_channel) = success {
             msg.channel_id
                 .say(&ctx.http, &format!("Joined {}", connect_to.mention()))
-                .await;
+                .await?;
 
         let chan_id = msg.channel_id;
 
@@ -172,6 +180,8 @@ async fn join(ctx: &Context, msg: &Message) -> CommandResult {
 
 
 #[command]
+#[description = "Leaves the voice channel you are currently in"]
+#[usage = "!leave"]
 #[only_in(guilds)]
 async fn leave(ctx: &Context, msg: &Message) -> CommandResult {
     let guild = msg.guild(&ctx.cache).unwrap();
@@ -192,21 +202,23 @@ async fn leave(ctx: &Context, msg: &Message) -> CommandResult {
         if let Err(e) = manager.remove(guild_id).await {
                 msg.channel_id
                     .say(&ctx.http, format!("Failed: {:?}", e))
-                    .await;
+                    .await?;
         } else {
             msg.channel_id.send_message(ctx, |m|
                 m.content(format!("Successfully left <#{}>", channel.0))
-            ).await;
+            ).await?;
         }
         
 } else {
-        msg.reply(ctx, "Not in a voice channel").await;
+        msg.reply(ctx, "Not in a voice channel").await?;
     }
 
     Ok(())
 }
 
 #[command]
+#[description = "Pauses the current song playing"]
+#[usage = "!pause"]
 #[only_in(guilds)]
 async fn pause(ctx: &Context, msg: &Message) -> CommandResult {
     let guild = msg.guild(&ctx.cache).unwrap();
@@ -222,7 +234,7 @@ async fn pause(ctx: &Context, msg: &Message) -> CommandResult {
         None => {
             msg.channel_id.send_message(ctx, |m|
                 m.content("Not in a voice channel")
-            ).await;
+            ).await?;
 
             return Ok(());
         },
@@ -233,7 +245,7 @@ async fn pause(ctx: &Context, msg: &Message) -> CommandResult {
     if handler.queue().current().is_none() {
         msg.channel_id.send_message(ctx, |m|
             m.content("Nothing playing currently")
-        ).await;
+        ).await?;
         return Ok(());
     }
 
@@ -250,26 +262,21 @@ async fn pause(ctx: &Context, msg: &Message) -> CommandResult {
         
 
     if matches!(play_status, PlayMode::Play) {
-        msg.channel_id.say(&ctx.http, "Already paused").await;
+        msg.channel_id.say(&ctx.http, "Already paused").await?;
     } else {
-        current_track.pause();
+        current_track.pause()?;
 
-        msg.channel_id.say(&ctx.http, format!("Paused **{}**", current_track.metadata().title.clone().unwrap())).await;
+        msg.channel_id.say(&ctx.http, format!("Paused **{}**", current_track.metadata().title.clone().unwrap())).await?;
     }
 
     Ok(())
 }
 
 #[command]
+#[description = "Plays a song, or enqueues it if a song is already playing"]
+#[usage = "!play <song>"]
 #[only_in(guilds)]
 async fn play(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
-    let search = args.message().to_string();
-
-    if search.len().eq(&0) {
-        resume(ctx, msg, args.clone()).await.unwrap();
-        return Ok(())
-    }
-
     let guild = msg.guild(&ctx.cache).unwrap();
     let guild_id = guild.id;
 
@@ -281,26 +288,53 @@ async fn play(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     if let None = manager.get(guild_id) {
         join(ctx, msg, args.clone()).await.unwrap();
         if let None = manager.get(guild_id) {
-            
             return Ok(());
         }
     }
 
     let handler_lock = manager.get(guild_id).unwrap();
-    let mut handler = handler_lock.lock().await;
+    let handler = handler_lock.lock().await;
     let queue = handler.queue();
-
     let source: Restartable;
-    if search.starts_with("http") {
-        source = Restartable::ytdl(search.clone(), true).await.unwrap();
+    let mut metadata: Metadata;
+
+    if msg.attachments.len() > 0 {
+        let mut handler = handler_lock.lock().await;
+        let attachment = &msg.attachments[0];
+        let file_name = attachment.filename.clone();
+        let data = attachment.download().await.unwrap();
+        let mut file = File::create(file_name.clone()).unwrap();
+        file.write_all(&data)?;
+
+        let source = Restartable::ffmpeg(file_name, true).await?;
+        let (song, handle) = tracks::create_player(source.into());
+
+        metadata = handle.metadata().to_owned();
+        metadata.source_url.replace(msg.link());
+        metadata.channel.replace(msg.author.name.clone());
+        metadata.title.replace(attachment.filename.clone());
+
+        handler.enqueue(song);
     } else {
-        source = Restartable::ytdl_search(&search, true).await.unwrap();
-    }
-    
-    if queue.current().is_none() {
+        let mut handler = handler_lock.lock().await;
+        let search = args.message().to_string();
+
+        if search.len().eq(&0) {
+            resume(ctx, msg, args.clone()).await.unwrap();
+            return Ok(())
+        }
+
+        if search.starts_with("http") {
+            source = Restartable::ytdl(search.clone(), true).await.unwrap();
+        } else {
+            source = Restartable::ytdl_search(&search, true).await.unwrap();
+        }
         let song = handler.enqueue_source(source.into());
         drop(handler);
-        let metadata = song.metadata();
+        metadata = song.metadata().to_owned();
+    }    
+    if queue.current().is_none() {
+        ctx.online().await;
 
         msg.channel_id.send_message(ctx.clone(), |m|
             m.embed(|e| {
@@ -333,10 +367,6 @@ async fn play(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         )).await.unwrap();
 
     } else {
-        let track = handler.enqueue_source(source.into());
-        drop(handler);
-        let metadata = track.metadata();
-
         msg.channel_id.send_message(ctx, |m| 
             m.content(format!("Enqueued **{}** by **{}**", metadata.title.clone().unwrap(), metadata.channel.clone().unwrap()))
             ).await.unwrap();
@@ -347,6 +377,8 @@ async fn play(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 
 
 #[command]
+#[description = "Gets the current queue"]
+#[usage = "!queue"]
 #[only_in(guilds)]
 async fn queue(ctx: &Context, msg: &Message) -> CommandResult {
     let guild = msg.guild(&ctx.cache).unwrap();
@@ -364,29 +396,31 @@ async fn queue(ctx: &Context, msg: &Message) -> CommandResult {
         let queue = handler.queue().current_queue();
         drop(handler);
 
-        if queue.len().eq(&0) || now_playing.is_none() {
-            msg.channel_id.send_message(ctx, |m| m.content("Nothing in the queue")).await;
+        if queue.len() == 0 || now_playing.is_none() {
+            msg.channel_id.send_message(ctx, |m| m.content("Nothing in the queue")).await?;
 
             return Ok(())
         } 
 
         let now_playing = now_playing.unwrap();
         let metadata = now_playing.metadata();
+        let extra_info = now_playing.get_info().await?;
 
-        for (i, j) in queue.iter().zip(
-            1..(queue.len() + 1)
-        ) {
-            if j == 1 { continue }
-            description.push_str(
-                &format!("**{})** [{}]({})\n", j-1, i.metadata().title.clone().unwrap(), i.metadata().source_url.clone().unwrap()) as &str
-            )
+        if queue.len() >= 2 {
+            for (i, j) in queue.iter().zip(
+                1..(queue.len() + 1)
+            ) {
+                if j == 1 { continue }
+                description.push_str(
+                    &format!("**{})** [{}]({})\n", j-1, i.metadata().title.clone().unwrap(), i.metadata().source_url.clone().unwrap()) as &str
+                )
+            }
         }
-
         msg.channel_id.send_message(ctx, |m| 
             m.embed(|e|
                 e.field(
                     "• Now Playing",
-                    format!("[{}]({})", metadata.title.clone().unwrap(), metadata.source_url.clone().unwrap()),
+                    format!("[{}]({}) [{}:{:#?}]", metadata.title.clone().unwrap(), metadata.source_url.clone().unwrap(), extra_info.play_time.as_secs(), metadata.duration.clone().unwrap()),
                     false
                 )
                 .field(
@@ -395,19 +429,21 @@ async fn queue(ctx: &Context, msg: &Message) -> CommandResult {
                     false
                 )
                 .color(Colour::GOLD)
-            )).await;
+            )).await?;
 
 
     } else {
         msg.channel_id
             .say(&ctx.http, "Not playing any music right now")
-            .await;
+            .await?;
     }
 
     Ok(())
 }
 
 #[command]
+#[description = "Skips the song currently playing and goes to the next in queue"]
+#[usage = "!skip"]
 #[only_in(guilds)]
 async fn skip(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
     let guild = msg.guild(&ctx.cache).unwrap();
@@ -422,24 +458,37 @@ async fn skip(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
         let handler = handler_lock.lock().await;
         let queue = handler.queue();
         drop(&handler);
+        if let None = queue.current() {
+            msg.channel_id.say(ctx, "Not playing any music right now").await?;
+            return Ok(())
+        }
+        let song = queue.current().unwrap();
         let _ = queue.skip();
 
         msg.channel_id
-            .say(
-                &ctx.http,
-                format!("Song skipped: {} in queue.", queue.len()),
+            .send_message(ctx, |m|
+                m.embed(|e| 
+                    e.description("Skipped {}.")
+                    .color(Colour::GOLD)
+                    .footer(|f|
+                        f.text(format!("Invoked by {}", msg.author.name))
+                        .icon_url(msg.author.face())
+                    )
+                )
             )
-            .await;
+            .await?;
     } else {
         msg.channel_id
             .say(&ctx.http, "Not in a voice channel to play in")
-            .await;
+            .await?;
     }
 
     Ok(())
 }
 
 #[command]
+#[description = "Clears the queue and stops playing the current song. Also leaves the voice channel."]
+#[usage = "!stop"]
 #[only_in(guilds)]
 async fn stop(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
     let guild = msg.guild(&ctx.cache).unwrap();
@@ -456,17 +505,19 @@ async fn stop(ctx: &Context, msg: &Message, _args: Args) -> CommandResult {
         drop(&handler);
         queue.stop();
 
-        msg.channel_id.say(&ctx.http, "Skipped song and cleared queue").await;
+        msg.channel_id.say(&ctx.http, "Skipped song and cleared queue").await?;
     } else {
         msg.channel_id
             .say(&ctx.http, "Not in a voice channel to play in")
-            .await;
+            .await?;
     }
 
     Ok(())
 }
 
 #[command]
+#[description = "Resumes the current song after pausing"]
+#[usage = "!resume"]
 #[only_in(guilds)]
 async fn resume(ctx: &Context, msg: &Message) -> CommandResult {
     let guild = msg.guild(&ctx.cache).unwrap();
@@ -482,7 +533,7 @@ async fn resume(ctx: &Context, msg: &Message) -> CommandResult {
         if handler.queue().current().is_none() {
             msg.channel_id.send_message(ctx, |m|
                 m.content("Nothing playing currently")
-            ).await;
+            ).await?;
             return Ok(());
         }
     
@@ -501,14 +552,183 @@ async fn resume(ctx: &Context, msg: &Message) -> CommandResult {
             current_track.play();
             msg.channel_id.send_message(ctx, |m|
                 m.content(format!("Resumed **{}**", current_track.metadata().title.clone().unwrap()))
-            ).await;
+            ).await?;
         }
 
     } else {
         msg.channel_id
             .say(&ctx.http, "No music to resume")
-            .await;
+            .await?;
     }
+
+    Ok(())
+}
+
+#[command]
+#[description = "Removes a song in the queue"]
+#[usage = "!remove <number>"]
+#[only_in(guilds)]
+async fn remove(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
+    if let Err(_s) = args.parse::<usize>() {
+        msg.channel_id.send_message(ctx, |m|
+            m.content("Please enter an index (e.g. `1`")
+        ).await?;
+        
+        return Ok(());
+    }
+
+    let index = args.parse::<usize>().unwrap();
+
+    let guild = msg.guild(&ctx.cache).unwrap();
+    let guild_id = guild.id;
+    let manager = songbird::get(ctx)
+        .await
+        .expect("Songbird Voice Client placed in at initialisation")
+        .clone();
+
+    if let Some(handler_lock) = manager.get(guild_id) {
+        let handler = handler_lock.lock().await;
+        let queue = handler.queue();
+
+        if queue.len() < 1 {
+            msg.channel_id.send_message(ctx, |m|
+                m.content("Nothing in the queue")
+            ).await?;
+            
+            return Ok(());
+        }
+
+        if let Some(song) = queue.dequeue(index) {
+            msg.channel_id.send_message(ctx, |m|
+                m.add_embed(|e|
+                    e.title("Removed Song from Queue")
+                        .description(format!("Removed **{:#?}** from the queue (", song.metadata().title))
+                        .color(Colour::GOLD)
+                        .footer(|f|
+                            f.text(format!("Invoked by {}", msg.author.name))
+                                .icon_url(msg.author.face())
+                        )
+                )).await?;
+        } else {
+            msg.channel_id.send_message(ctx, |m|
+                m.content(format!("There is no song at index {}", index))
+            ).await?;
+            
+            return Ok(());
+        }
+        
+    } else {
+        msg.channel_id.send_message(ctx, |m|
+            m.content("Nothing playing currently")
+        ).await?;
+        
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+#[command("loop")]
+#[description = "Enables or disables looping"]
+#[usage = "!loop [mode] (\"current\" or \"disable\""]
+#[only_in(guilds)]
+async fn loop_command(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
+    let guild = msg.guild(&ctx.cache).unwrap();
+    let guild_id = guild.id;
+    let manager = songbird::get(ctx)
+        .await
+        .expect("Songbird Voice Client placed in at initialisation")
+        .clone();
+
+    if let Some(handler_lock) = manager.get(guild_id) {
+        let handler = handler_lock.lock().await;
+        let queue = handler.queue();
+
+        let loop_type: &str;
+        let args = args.message();
+    
+        if args != "current" || args != "queue" {
+            if queue.current().unwrap().get_info().await.unwrap().loops != LoopState::Infinite {
+                loop_type = "current";
+            } else {
+                loop_type = "disable";
+            }
+        } else {
+            loop_type = args;
+        }
+
+        if loop_type == "current" {
+            queue.current().unwrap().enable_loop()?;
+        } else {
+            queue.current().unwrap().disable_loop()?;
+        }
+
+        msg.channel_id.send_message(ctx, |m|
+            m.embed(|e|
+                e.description(format!("Loop set to `{}`", loop_type))
+                .color(Colour::GOLD)
+            )
+        ).await?;
+
+    } else {
+        msg.channel_id.send_message(ctx, |m|
+            m.content("Nothing playing currently")
+        ).await?;
+    }
+
+    Ok(())
+}
+
+#[command]
+#[description = "Sets the volume of the currently playing track"]
+#[usage = "!volume <number 1-100>"]
+#[only_in(guilds)]
+async fn volume(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
+    if let Err(_e) = args.message().parse::<f32>() {
+        msg.channel_id.send_message(ctx, |m|
+            m.content("Volume must be a number between `1-100`")
+        ).await?;
+
+        return Ok(());
+    }
+
+    let volume = args.message().parse::<f32>().unwrap();
+
+    let guild = msg.guild(&ctx.cache).unwrap();
+    let guild_id = guild.id;
+    let manager = songbird::get(ctx)
+        .await
+        .expect("Songbird Voice Client placed in at initialisation")
+        .clone();
+
+    if let Some(handler_lock) = manager.get(guild_id) {
+        let handler = handler_lock.lock().await;
+        let queue = handler.queue();
+        let current = queue.current();
+
+        if current.is_none() {
+            msg.channel_id.send_message(ctx, |m|
+                m.content("Nothing playing currently")
+            ).await?;  
+            
+            return Ok(());
+        }
+
+        current.unwrap().set_volume(volume);
+
+        msg.channel_id.send_message(ctx, |m|
+            m.embed(|e|
+                e.description(format!("Set the volume to `{}`", volume))
+                    .color(Colour::GOLD)
+            )
+        ).await?;
+
+    } else {
+        msg.channel_id.send_message(ctx, |m|
+            m.content("Nothing playing currently")
+        ).await?;
+    }
+
 
     Ok(())
 }

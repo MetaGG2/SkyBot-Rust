@@ -40,3 +40,25 @@ pub fn duration_formatter(duration: Duration) -> String {
 
     formatted.join(", ")
 }
+
+pub fn num_prefix(num: usize) -> String {
+    let prefixed: String;
+
+    if num.to_string().ends_with("1") {
+        prefixed = format!("{num}st");
+    }
+
+    else if num.to_string().ends_with("2") {
+        prefixed = format!("{num}nd");
+    }
+
+    else if num.to_string().ends_with("3") {
+        prefixed = format!("{num}rd");
+    }
+
+    else {
+        prefixed = format!("{num}th");
+    }
+
+    prefixed
+}

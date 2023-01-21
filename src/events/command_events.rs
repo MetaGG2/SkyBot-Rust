@@ -22,9 +22,9 @@ pub async fn before(ctx: &Context, msg: &Message, command_name: &str) -> bool {
 
     if let Err(why) = write!(
         file,
-        "{} command: Used by {:#?} on {} with arguments \"{}\" in channel {:#?}\n", 
+        "{} command: Used by {} on {} with arguments \"{}\" in channel {:#?}\n", 
             command_name, 
-            (msg.author.name.clone() + msg.author.discriminator.to_string().as_str()), 
+            msg.author.tag(),
             Local::now().format("%a %v %l:%M:%S %p"),
             msg.content.trim_end(), 
             msg.channel_id.name(ctx).await.unwrap()

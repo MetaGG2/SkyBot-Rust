@@ -8,7 +8,7 @@ use std::{env, fs};
 use serenity::async_trait;
 use serenity::framework::StandardFramework;
 use serenity::model::gateway::Ready;
-use serenity::model::prelude::UserId;
+use serenity::model::prelude::{UserId, Activity};
 use serenity::prelude::*;
 
 use songbird::SerenityInit;
@@ -17,7 +17,10 @@ struct Events;
 
 #[async_trait]
 impl EventHandler for Events {
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        ctx.set_activity(Activity::watching("OSD")).await;
+        ctx.idle().await;
+
         println!("{} is ready", ready.user.name);
     }
 }
@@ -55,7 +58,10 @@ async fn main() {
             .on_mention(Some(UserId::from(796491764092633128)))
             .prefix("!")
             .with_whitespace(false)
-            .owners(owners))
+            .owners(owners)
+            .case_insensitivity(true)
+            .no_dm_prefix(true)
+        )
         .help(&commands::help::HELP) // src/commands/help.rs
         .before(events::command_events::before) // src/events/command_events.rs
         .after(events::command_events::after) // src/events/command_events.rs
